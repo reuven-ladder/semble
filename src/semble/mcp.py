@@ -8,7 +8,8 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from semble.index import SembleIndex
-from semble.index.dense import load_model
+from semble.index.dense import _DEFAULT_MODEL_NAME, load_model
+from semble.persistence import CACHE_DIRNAME, cache_dir_for, load_index, meta_mtime
 from semble.types import Encoder
 from semble.utils import _format_results, _is_git_url, _resolve_chunk
 
@@ -101,10 +102,17 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
     return server
 
 
-async def serve(path: str | None = None, ref: str | None = None) -> None:
-    """Start an MCP stdio server, optionally pre-indexing a default source."""
+async def serve(path: str | None = None, ref: str | None = None, use_cache: bool = True) -> None:
+    """Start an MCP stdio server, optionally pre-indexing a default source.
+
+    :param path: Default source to pre-index (local dir or git URL).
+    :param ref: Branch/tag for git URLs.
+    :param use_cache: If True (default), local paths persist and reload from
+        ``<path>/.semble``; the cache reloads automatically when ``meta.json``
+        mtime advances (e.g. after ``semble reindex`` or ``semble watch``).
+    """
     model = await asyncio.to_thread(load_model)
-    cache = _IndexCache(model=model)
+    cache = _IndexCache(model=model, use_cache=use_cache)
     if path:
         await cache.get(path, ref=ref)
 
@@ -113,17 +121,33 @@ async def serve(path: str | None = None, ref: str | None = None) -> None:
 
 
 class _IndexCache:
-    """Cache of indexed repos and local paths for the lifetime of the MCP server process."""
+    """Cache of indexed repos and local paths for the lifetime of the MCP server process.
 
-    def __init__(self, model: Encoder) -> None:
+    For local paths, the index is also persisted to ``<path>/.semble`` so that
+    external refresh (git hook, file watcher) can update it. ``get()`` re-checks
+    ``meta.json`` mtime and transparently reloads when it advances.
+    """
+
+    def __init__(self, model: Encoder, use_cache: bool = True) -> None:
         """Initialise an empty cache with a shared embedding model."""
         self._model = model
+        self._use_cache = use_cache
         self._tasks: dict[str, asyncio.Task[SembleIndex]] = {}
+        self._meta_mtimes: dict[str, float] = {}
 
     async def get(self, source: str, ref: str | None = None) -> SembleIndex:
         """Return an index for the requested source, building and caching it on first access."""
         is_git = _is_git_url(source)
         cache_key = (f"{source}@{ref}" if ref else source) if is_git else str(Path(source).resolve())
+
+        if not is_git and self._use_cache:
+            cdir = cache_dir_for(Path(cache_key))
+            current = meta_mtime(cdir)
+            cached = self._meta_mtimes.get(cache_key)
+            if current is not None and cached is not None and current > cached:
+                # On-disk index has been refreshed by an external process; drop our cached task.
+                self._tasks.pop(cache_key, None)
+                self._meta_mtimes.pop(cache_key, None)
 
         if cache_key not in self._tasks:
             if is_git:
@@ -132,11 +156,11 @@ class _IndexCache:
                 )
             else:
                 self._tasks[cache_key] = asyncio.create_task(
-                    asyncio.to_thread(SembleIndex.from_path, cache_key, model=self._model)
+                    asyncio.to_thread(self._load_or_build, cache_key)
                 )
         task = self._tasks[cache_key]
         try:
-            return await asyncio.shield(task)
+            index = await asyncio.shield(task)
         except asyncio.CancelledError:  # pragma: no cover
             if task.done():
                 self._tasks.pop(cache_key, None)
@@ -145,3 +169,24 @@ class _IndexCache:
             # Build failed: evict so the next caller can retry.
             self._tasks.pop(cache_key, None)
             raise
+
+        if not is_git and self._use_cache:
+            cdir = cache_dir_for(Path(cache_key))
+            mt = meta_mtime(cdir)
+            if mt is not None:
+                self._meta_mtimes[cache_key] = mt
+        return index
+
+    def _load_or_build(self, path: str) -> SembleIndex:
+        """Load persisted index from ``path/.semble`` if present; otherwise build and persist."""
+        cdir = cache_dir_for(Path(path))
+        if self._use_cache:
+            existing = load_index(cdir, model=self._model)
+            if existing is not None:
+                return existing
+        return SembleIndex.from_path(
+            path,
+            model=self._model,
+            cache_dir=cdir if self._use_cache else None,
+            model_name=_DEFAULT_MODEL_NAME,
+        )

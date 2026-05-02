@@ -32,6 +32,7 @@ dependencies = [
     "bm25s>=0.2.0",
     "chonkie[code]==1.6.2",
     "pathspec>=0.12",
+    "watchdog>=4.0",
 ]
 
 [project.optional-dependencies]
