@@ -5,17 +5,27 @@ Layout under ``<root>/.semble/``::
     chunks.jsonl    one JSON object per chunk
     embeddings.npy  float32 array, row order matches chunks.jsonl
     meta.json       index metadata + per-file mtime map
+    .lock           cross-process advisory lock for writers
 
 BM25 and the vicinity backend are not persisted directly — they are rebuilt
 from chunks/embeddings on load, which is the cheap step in indexing.
+
+Writers are serialized cross-process via an ``fcntl`` advisory lock on
+``.lock``. Each of the three payload files is replaced via a per-writer
+unique ``.tmp`` plus ``rename(2)`` so a partial write or a concurrent writer
+can never leave the cache half-updated.
 """
 
 from __future__ import annotations
 
+import io
 import json
+import os
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator
 
 import bm25s
 import numpy as np
@@ -62,34 +72,90 @@ def _meta_path(d: Path) -> Path:
     return d / "meta.json"
 
 
+def _lock_path(d: Path) -> Path:
+    return d / ".lock"
+
+
 def meta_mtime(cache_dir: Path) -> float | None:
     """Return mtime of meta.json or None if absent."""
     p = _meta_path(cache_dir)
     return p.stat().st_mtime if p.exists() else None
 
 
+@contextmanager
+def _writer_lock(cache_dir: Path) -> Iterator[None]:
+    """Exclusive cross-process advisory lock for index writers.
+
+    Multiple processes (e.g. ``semble watch`` and a ``post-commit`` hook
+    invoking ``semble reindex``) can otherwise step on each other's
+    rename-into-place, corrupting the cache. ``fcntl.flock`` serializes them.
+    """
+    import fcntl
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(_lock_path(cache_dir)), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically via a per-writer unique tmp file."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        with tmp.open("wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+    except BaseException:
+        # Best-effort cleanup; tmp may already have been renamed.
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    _atomic_write_bytes(path, text.encode("utf-8"))
+
+
 def save_index(index: SembleIndex, cache_dir: Path) -> None:
-    """Persist chunks, embeddings, and meta to ``cache_dir``."""
+    """Persist chunks, embeddings, and meta to ``cache_dir``.
+
+    Serialized cross-process and atomic per-file: a concurrent writer either
+    sees the full pre-state or the full post-state, never a torn mix.
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     embeddings = np.asarray(index._semantic_index._vectors, dtype=np.float32)
-    np.save(_embeddings_path(cache_dir), embeddings, allow_pickle=False)
 
-    with _chunks_path(cache_dir).open("w", encoding="utf-8") as f:
-        for c in index.chunks:
-            f.write(
-                json.dumps(
-                    {
-                        "content": c.content,
-                        "file_path": c.file_path,
-                        "start_line": c.start_line,
-                        "end_line": c.end_line,
-                        "language": c.language,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
+    emb_buf = io.BytesIO()
+    np.save(emb_buf, embeddings, allow_pickle=False)
+    emb_bytes = emb_buf.getvalue()
+
+    chunks_buf = io.StringIO()
+    for c in index.chunks:
+        chunks_buf.write(
+            json.dumps(
+                {
+                    "content": c.content,
+                    "file_path": c.file_path,
+                    "start_line": c.start_line,
+                    "end_line": c.end_line,
+                    "language": c.language,
+                },
+                ensure_ascii=False,
             )
+        )
+        chunks_buf.write("\n")
+    chunks_text = chunks_buf.getvalue()
 
     meta = {
         "schema_version": SCHEMA_VERSION,
@@ -100,10 +166,12 @@ def save_index(index: SembleIndex, cache_dir: Path) -> None:
         "include_text_files": index._include_text_files,
         "file_state": index._file_state,
     }
-    # Atomic write so partial writes never appear newer than valid state.
-    tmp = _meta_path(cache_dir).with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    tmp.replace(_meta_path(cache_dir))
+    meta_text = json.dumps(meta, indent=2)
+
+    with _writer_lock(cache_dir):
+        _atomic_write_bytes(_embeddings_path(cache_dir), emb_bytes)
+        _atomic_write_text(_chunks_path(cache_dir), chunks_text)
+        _atomic_write_text(_meta_path(cache_dir), meta_text)
 
 
 def _load_chunks(path: Path) -> list[Chunk]:
