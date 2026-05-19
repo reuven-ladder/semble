@@ -30,9 +30,7 @@ def watch(
         from watchdog.events import FileSystemEvent, FileSystemEventHandler
         from watchdog.observers import Observer
     except ImportError as exc:
-        raise RuntimeError(
-            "watchdog is required for `semble watch`. Install with: pip install watchdog"
-        ) from exc
+        raise RuntimeError("watchdog is required for `semble watch`. Install with: pip install watchdog") from exc
 
     if index._root is None:
         raise RuntimeError("watch() requires an index built from a local path")
@@ -42,6 +40,9 @@ def watch(
 
     pending: set[str] = set()
     lock = threading.Lock()
+    # Serializes ``_flush`` bodies so a debounce timer firing while a previous
+    # refresh is still running cannot run ``index.refresh`` twice in parallel.
+    flush_lock = threading.Lock()
     timer: threading.Timer | None = None
 
     def _is_relevant(path_str: str) -> bool:
@@ -61,20 +62,21 @@ def watch(
 
     def _flush() -> None:
         nonlocal timer
-        with lock:
-            batch = list(pending)
-            pending.clear()
-            timer = None
-        if not batch:
-            return
-        try:
-            index.refresh(batch)
-        except Exception as exc:
-            print(f"[semble watch] refresh failed: {exc}")
-            return
-        if on_refresh is not None:
-            on_refresh(batch)
-        print(f"[semble watch] refreshed {len(batch)} file(s)")
+        with flush_lock:
+            with lock:
+                batch = list(pending)
+                pending.clear()
+                timer = None
+            if not batch:
+                return
+            try:
+                index.refresh(batch)
+            except Exception as exc:
+                print(f"[semble watch] refresh failed: {exc}", flush=True)
+                return
+            if on_refresh is not None:
+                on_refresh(batch)
+            print(f"[semble watch] refreshed {len(batch)} file(s)", flush=True)
 
     class _Handler(FileSystemEventHandler):
         def on_any_event(self, event: FileSystemEvent) -> None:
